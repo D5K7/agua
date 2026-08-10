@@ -1,0 +1,637 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[UTF8]{ctex}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{multirow}
+
+\newtheorem{definition}{定义}[section]
+
+\title{Agua：面向学习增强系统的基于概念的解释器\\
+\large（中文编译整理版，译自 ACM SIGCOMM 2025 论文）}
+\author{Sagar Patel$^{1}$ \quad Dongsu Han$^{2}$ \quad Nina Narodystka$^{3}$ \quad Sangeetha Abdu Jyothi$^{1}$\\[4pt]
+\small $^{1}$加州大学欧文分校（University of California, Irvine）\\
+\small $^{2}$韩国科学技术院（KAIST）\\
+\small $^{3}$博通旗下 VMware Research（VMware Research by Broadcom）\\[6pt]
+\small 中文翻译整理：本文档为原论文内容的忠实中文译述与结构化整理，供个人学习研究使用。}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+深度学习在系统与网络领域已展现出优于人工设计方案的性能，但其推广应用常常受制于人们难以理解与调试这些模型这一事实。可解释性技术的目标正是弥合这一差距，通过揭示模型决策背后的依据来提供洞察。然而，现有的解释方法主要着眼于识别对决策影响最大的输入特征，这迫使运维人员不得不对诸如“缓冲区 $t-1$ 时刻取值”这类底层信号进行繁琐的人工分析。
+
+本文提出 Agua，一个使用高层次、人类可理解的概念（例如“网络状况剧烈波动”）来解释模型决策的可解释性框架。我们所提出的基于概念的可解释性框架为构建智能化网络系统奠定了基础，使运维人员能够真正与数据驱动的系统进行交互。为了以概念层面的推理来解释控制器的输出，Agua 为控制器构建了一个基于概念的代理（surrogate）模型，该模型包含两个映射：一是从控制器的嵌入表示到预定义概念空间的映射，二是从概念空间到控制器输出的映射。通过在自适应比特率流媒体、拥塞控制以及分布式拒绝服务（DDoS）攻击检测这三类差异显著的应用上进行的全面评估，我们证明 Agua 能够生成鲁棒且高保真（93\%--99\%）的解释，其表现优于已有方法。最后，我们展示了 Agua 在网络系统环境中的若干实际用途：调试非预期行为、识别分布漂移、设计基于概念的高效再训练策略，以及扩充特定环境下的数据集。
+\end{abstract}
+
+\noindent\textbf{关键词：}机器学习赋能系统、可解释性、大语言模型
+
+\section{引言}
+
+如今，学习增强型（learning-enabled）控制器在众多计算机系统与网络应用中的表现已经超越了人工设计的方案，例如自适应比特率流媒体、拥塞控制、资源管理、边缘缓存以及网络安全等场景。然而，运维人员往往难以驾驭这些方案，原因在于它们难以被解释、调试与推理。
+
+现有的针对学习增强型控制器的可解释性方案，大多聚焦于通过识别对决策影响最大的输入特征来解释其行为。例如，Metis 采用模型蒸馏技术，将深度学习模型转化为决策树，并以特征级别的决策路径作为解释。在此基础上，Trustee 进一步通过分析该决策树，判断所学得的模型中是否存在归纳偏置。
+
+然而，这类基于特征的解释方案存在内在局限。它们生成的决策树通常规模庞大，包含成百上千个节点，决策路径也十分复杂。例如，图~1c 中利用 Trustee 为某视频流控制器生成的解释报告，其决策路径为 [缓冲区$_{t-1}$ $\leq$ 0.91；分片大小$_{t-1}$ $\leq$ 0.05；历史画质$_{t-1}$ $\leq$ 0.66；……]。这种基于规则的解释虽然比神经网络本身更具可读性，但由于牵涉跨越多个互不相关特征的数十个决策节点，理解起来仍然十分困难。更为重要的是，现有的基于特征的解释技术无法刻画由多个特征相互作用而产生的高层次概念。例如，"网络状况剧烈波动"这一现象往往无法归因于单一特征，而需要综合分析多个特征在多个时间点上的模式，才能理解其叠加影响。
+
+正是意识到基于特征的技术存在这些根本性局限，计算机视觉领域近年来提出了新一代可解释模型——概念瓶颈模型（Concept-Bottleneck Models, CBMs）。与依赖底层特征的传统方法不同，这类模型首先预测更高层次的概念（例如"胡须"或"尾巴"），再利用这些概念得出最终输出（例如"猫"）。这种方式使用户无需检查逐个像素值，即可对模型决策进行直观推理。
+
+我们认为，概念同样有潜力弥合运维人员与智能系统之间的鸿沟。在系统场景中，我们将概念设想为跨越多个时间戳与多个特征的控制器行为高层抽象，用以捕捉简单的基于特征的解释所忽视的模式。例如，在视频流场景中，诸如"预判到网络拥塞"或"缓冲区正在快速耗尽"这样的概念，相比吞吐量或延迟等原始数值，能够提供更清晰的洞察。这种更强的清晰度可以提升系统的透明度与可操控性，使运维人员能够有效地管理数据驱动的智能系统。
+
+然而，计算机视觉领域所使用的基于概念的技术无法直接迁移到系统场景，原因主要有三点：其一，系统控制器的输入是异构且无标签的数据，而视觉模型处理的是图像，且拥有丰富可用的标签资源；其二，学习增强型系统中的概念更为复杂，通常需要多个抽象层级才能刻画；其三，系统控制器通常需要处理复杂的时间动态与长期依赖关系。因此，尽管我们从计算机视觉领域的"概念"理念中获得了启发，已有技术却并不能直接套用到系统场景，需要为学习增强型系统重新设计一套基于概念的理解方法。
+
+本文重新构思了面向系统的基于概念的可解释性方法，提出 Agua——该领域的第一个框架。为应对系统环境所特有的挑战，我们设计了一种融合领域知识、数据驱动分析与大语言模型（LLM）的概念生成机制。首先，我们向大语言模型提供相关文献或设计文档，据此推导出一组基础概念；这组基础概念还可由运维人员进一步扩充或过滤。随后，我们为控制器构建一个基于概念的代理模型，该模型以基础概念作为中间表示，学习从控制器输入空间到输出空间的映射。为此，我们将代理模型拆分为两部分：首先构建\emph{概念映射函数}，将控制器输入转换到基础概念所构成的空间；然后学习\emph{输出映射函数}，将这些概念进行线性组合以重构控制器的输出。这种两阶段的代理模型使 Agua 能够揭示驱动其行为的主要概念，同时也具备广泛的适用性，可用于采用监督学习、半监督学习或强化学习的异构系统控制器。
+
+我们在三种不同应用上验证了 Agua 的有效性：自适应比特率流媒体（ABR）、拥塞控制（CC）以及 DDoS 检测。Agua 不仅易于理解，而且在所有应用上都取得了高保真度（均超过 0.933），最高比 Trustee 高出 0.69。Agua 还在系统生命周期的每个阶段解锁了新的能力：在设计与测试阶段，Agua 能够指出导致非预期行为的具体概念，帮助运维人员直观地诊断并修复问题；在部署阶段，它通过监测关键概念随时间的变化来检测分布漂移；在再训练阶段，Agua 利用概念层面的洞察来指导模型更新与数据增强，从而提升性能。
+
+综上，本文的主要贡献如下：
+\begin{itemize}[leftmargin=1.5em]
+\item 我们提出将“概念”作为跨越多个特征与多个时间戳的高层抽象，用以捕捉复杂模式，从而理解学习增强型系统；
+\item 我们提出 Agua，作为首个面向系统的基于概念的解释器，融合了领域知识、数据驱动分析与大语言模型的能力；
+\item 我们在自适应比特率流媒体、拥塞控制与 DDoS 检测三类应用上评估 Agua，证明其兼具高保真度与低复杂度，优于现有最先进方法；
+\item 我们展示了 Agua 在系统生命周期各阶段所解锁的新能力，包括识别与调试非预期行为、检测分布漂移、指导再训练，以及扩充工作负载数据集；
+\item 我们验证了 Agua 在流水线多个环节抵御噪声的鲁棒性，包括大语言模型输出的波动，以及在开源与闭源大语言模型之间的一致性。
+\end{itemize}
+
+本工作不涉及任何伦理问题。
+
+\section{相关工作与研究动机}
+
+解释器旨在揭示不透明机器学习模型背后的推理逻辑。本节首先简要回顾已有技术，随后指出这些技术的局限性，并讨论计算机视觉领域中"概念"这一理念所带来的机遇；最后，我们详细分析将这些理念引入系统领域所面临的障碍，并阐明为何需要一种量身定制的解决方案。
+
+\subsection{已有的解释方法}
+
+系统领域已有的可解释性方法主要致力于识别最重要的输入特征——我们将这类工作归类为"基于特征的可解释性"。基于特征的解释器按其作用范围可分为两类：局部解释器与全局解释器。
+
+\textbf{局部特征解释器。} LIME、SHAP、Captum 等局部解释器针对特定输入实例解释模型的预测结果。它们通过对输入施加微小扰动生成扰动样本，并观察模型在这些样本上的预测结果，进而训练一个代理模型（如线性回归或显著性图）来拟合该扰动数据集，以此近似原始决策逻辑。该代理模型的参数即可揭示对该预测贡献最大的若干特征。
+
+\textbf{全局特征解释器。} 全局解释器则试图在整个输入空间上近似模型的行为。它们训练一个可解释的代理模型（如决策树、图结构或规则集），使其在一组具有代表性的输入数据上模拟原模型的输出。在系统领域中，Metis 构建全局决策树与超图来近似神经网络的行为；Trustee 在 Metis 基础上进一步改进，更好地平衡了保真度、复杂度与稳定性，并额外提供了信任度报告。
+
+\subsection{已有解释方法的不足}
+
+我们以最先进的自适应比特率（ABR）控制器 Gelato 为例，使用 Trustee 展示基于特征的解释器所存在的局限。Gelato 是一个深度强化学习控制器，输入为客户端观看体验的历史记录，输出为下一个视频分片应采用的比特率。
+
+\textbf{动机场景。} 设想这样一个场景：运维人员希望理解，为什么在缓冲区正在回升的某个特定状态下，Gelato 依然选择了较低的比特率（如图~1a 所示）。Trustee 为该控制器生成了一棵作为全局解释的决策树，完整版本包含 195 个决策节点、深度达 13 层；即便是经过剪枝的版本，也仍有 61 个节点、深度为 10 层。我们沿着剪枝后决策树上与该动机场景相对应的高亮路径（图~1c）生成解释，但即便如此，该解释依然难以理解——它涉及横跨多个不同特征（缓冲区、已选分片大小、即将到来的视频画质）且分散在不同时间点上的七个决策节点。
+
+基于特征的解释迫使运维人员去理解一套原本是为机器设计的特征集合的复杂细节，而这在缺乏丰富数据科学专业知识与大量人工分析的情况下往往难以做到。这一局限是所有基于特征的解释器所共有的内在缺陷。
+
+\begin{quote}\small\noindent\textbf{图 1：}Trustee 针对该动机场景状态生成的解释。(a) 该动机场景状态；(b) Agua 基于概念的解释；(c) 剪枝后 Trustee 报告中该状态对应的决策路径。其报告中完整版与剪枝版决策树规模均十分庞大，即便只筛选出该动机状态对应的决策路径，得到的解释依然十分复杂。\end{quote}
+
+\subsection{概念层面的视角与挑战}
+
+有鉴于基于特征方案的这些局限，计算机视觉领域提出了自解释的概念瓶颈模型（CBM）。CBM 对神经网络结构进行改造，引入一个中间的概念瓶颈层：模型首先接收图像，经由该层预测图像中存在的各类概念，再将这些概念组合起来得到该图像的最终标签。例如，模型可能会依据"喙"与"翅膀"这两个概念的权重，最终预测出"鸟"这一标签。
+
+受此启发，我们相信概念同样可以充当数据驱动系统与人类理解之间的桥梁。在系统场景中，概念可以表示植根于领域专业知识、定义明确的高层次理念（例如拥塞控制中的"丢包率不断上升"）。图~1b 展示了 Agua 针对上述动机场景所给出的解释：图中每根柱状条代表某一概念对该决策动作概率的贡献大小，可以清楚地看到，控制器选择低画质比特率的原因在于它检测到了"网络状况极度恶化"。这类基于概念的洞察，使运维人员能够快速而清晰地理解控制器的决策依据，并获得类似专家水平的高层次推理能力。
+
+然而，将计算机视觉领域的概念化技术迁移到系统场景并非易事。在计算机视觉中，一个关键的支撑条件是存在为图像标注概念的成熟工具：人工标注方法依赖图像标注任务本身的简单性，并借助 MTurk 等众包平台；更新的技术则采用 CLIP 等多模态图文模型。相比之下，系统数据是异构且无标签的，这使得概念的定义与标注变得困难。此外，系统中的概念更为复杂，往往需要多个抽象层级才能刻画；系统控制器还面临复杂的时间动态与长期依赖关系，这进一步增加了推理的难度。这些因素使我们无法照搬视觉领域的相关机制。
+
+尽管如此，我们仍然认为概念是通向准确且清晰解释的可行路径，因此本文提出重新思考面向系统的基于概念的可解释性方法。
+
+\section{Agua 的设计}
+
+我们提出 Agua，这是面向学习增强型系统的首个基于概念的可解释性框架。Agua 使运维人员能够使用高层次、类似专家表达的概念（例如"网络状况剧烈波动"）来理解控制器的行为，而不必像以往的解释器那样逐一检查底层特征。这一视角的转变使解释结果与运维人员的专业知识及实际需求更加契合。
+
+Agua 通过为控制器构建一个以概念作为中间表示的代理模型来实现这一目标。该代理模型包含两个关键组件：一个将控制器输入转换到概念空间的\emph{概念映射函数}，以及一个将概念重新转换为控制器输出的\emph{输出映射函数}。Agua 能够揭示驱动其决策的概念的线性组合，使运维人员可以直接洞察控制器的行为方式。
+
+Agua 通过一个融合领域知识、数据驱动分析与大语言模型的多阶段训练流水线来构建该代理模型（见图~2）：\textcircled{1}\emph{基础概念生成}——我们借助大语言模型，从相关领域文献中生成一组基础概念，运维人员可对其进一步过滤或扩充；随后分两阶段收集代理模型的训练数据：\textcircled{2}\emph{输入描述生成}——从数据集中取出每一条输入，提示大语言模型给出结构化的文本描述；\textcircled{3}\emph{输入概念嵌入}——利用文本嵌入模型对基础概念与前一步生成的输入描述进行嵌入，并据此在经验上标注概念相似度；\textcircled{4}\emph{概念映射函数训练}——利用已标注的概念相似度数据，训练一个将控制器嵌入映射到概念空间的函数；\textcircled{5}\emph{输出映射函数训练}——训练输出映射函数，将概念空间重新映射回控制器的输出。训练完成后，Agua 只需对其代理模型执行一次前向传播，即可解释原始控制器针对给定输入所作出的决策；输出映射函数中概念得分的线性组合权重，即揭示了排名靠前的关键概念。
+
+\begin{quote}\small\noindent\textbf{图 2：}训练工作流程。步骤 \textcircled{1}推导基础概念；随后 \textcircled{2}利用大语言模型生成输入描述；接着 \textcircled{3}使用文本嵌入模型对基础概念与输入描述进行嵌入，得到概念相似度得分；\textcircled{4}利用已生成的概念相似度得分（表示为以概念为行、相似度得分为整数等级的向量）依次训练概念映射函数；最后 \textcircled{5}以对应的控制器输出 $y$ 为训练目标，训练输出映射函数。\end{quote}
+
+\subsection{定义}
+
+我们在标准可解释性视角下，对训练一个基于概念的解释器这一问题给出形式化定义，其目标是找到给定模型 $f$ 的最佳代理近似。
+
+\begin{definition}[解释器]
+解释器 $f'$ 是通过最小化其输出与原模型输出之间的距离度量 $E$，从而近似原模型的一个代理函数：
+\[
+f' = \arg\min_{f'} E\big(f(x), f'(x)\big)
+\]
+其中 $f'$ 将输入 $x$ 映射到输出 $y$，$E$ 用于量化 $f(x)$ 与 $f'(x)$ 之间的差异。$E$ 同时也是定量评估 $f'$ 的标准指标（例如第 4 节中的保真度指标）。
+\end{definition}
+
+\begin{definition}[基于概念的解释器]
+基于概念的解释器的代理函数由两个函数复合而成：
+\[
+f'(x) = \Omega\big(\delta(x)\big) = W^{T}\delta(x) + b
+\]
+其中 $\delta: \mathbb{R}^{I}\to\mathbb{R}^{C}$ 是\emph{概念映射函数}，用于推断输入 $x$ 中各概念的相似度得分 $C$（例如是否存在"网络状况剧烈波动"）；$\Omega: \mathbb{R}^{C}\to\mathbb{R}^{n}$ 是\emph{输出映射函数}，通过线性组合这些概念得分来重构控制器的输出向量 $y$。输出映射函数是该模型中承担解释职能的部分——它是一个自解释函数，以概念为输入、以控制器的输出为输出。这里 $\mathbb{R}^{I}$ 为输入空间，$\mathbb{R}^{C}$ 为概念空间，$\mathbb{R}^{n}$ 为输出空间。需要注意的是，该定义同样允许 $\delta(x)$ 本身是对 $x$ 的一系列变换的复合；$\delta(x)$ 常常会包含控制器对 $x$ 所做的部分运算，以便利用 $x$ 在嵌入空间中已有的低维特征，并使 $f'$ 与控制器所处的空间对齐。
+\end{definition}
+
+\begin{definition}[基于概念的解释]
+给定输入 $x$ 及模型输出 $y$，基于概念的解释是一个向量 $w$，用以反映每个基础概念对 $y$ 的贡献大小。该向量通过将 $f'(x)$ 沿 $\Omega$ 反向追溯，还原出构成 $y$ 的各概念的线性组合而得到。
+\end{definition}
+
+\subsection{推导基础概念}
+
+基础概念是 Agua 生成解释的基本构件，控制器的输出被表达为这些概念的加权组合。合格的基础概念集合须满足以下四条准则：(i) 必须与控制器相关；(ii) 必须能够从其输入特征中被推断出来；(iii) 须以恰当的抽象层级覆盖控制器的整个输出空间；(iv) 概念彼此之间的重叠应尽量小。
+
+然而，即便对领域专家而言，构建一个同时满足上述全部要求的概念集合也颇具挑战。为此，我们设计了一套流程，综合利用综述文献与设计文档、经验分析以及大语言模型，来获得一个初始概念集合。
+
+具体做法是：将一篇相关综述文献附加到大语言模型的提示中，并指示其"聚焦于论文的背景与已有工作部分，总结影响\{目标领域\}中控制器决策的各项因素"。这些综述文献承载了控制器背后的研究脉络，使大语言模型的输出锚定于相关且已被检索到的事实。基于这一丰富的上下文，我们反复提示大语言模型"针对控制器决策 $y$ 的每一种可能取值，列举并描述其关键概念"，依次遍历所有可能的输出（对应图~2 中的步骤\textcircled{1}"概念生成"）。
+
+由于大语言模型并不了解我们上面列出的四条准则，这个初始概念集合未必能完全满足要求，运维人员可能需要凭借自身的领域专业知识对其进行扩充、调整或过滤。若概念之间存在重叠，得到的解释会难以理解；而若概念数量不足，解释的保真度又会偏低。为帮助运维人员进行过滤，我们引入了一种经验性的检验方法，即比较概念之间的两两相似度。由于每个概念都是一段丰富的文本描述，我们可以使用文本嵌入模型对其进行嵌入，并构建一个余弦相似度矩阵，其中矩阵元素 $(i,j)$ 表示概念 $C_i$ 与概念 $C_j$ 之间的相似度：
+\begin{equation}
+\text{ConceptSimilarity}_{i,j} = \frac{\epsilon(C_i)\cdot\epsilon(C_j)}{\lVert\epsilon(C_i)\rVert\,\lVert\epsilon(C_j)\rVert}, \qquad \forall i,j\in C
+\label{eq:concept-sim}
+\end{equation}
+其中 $\epsilon$ 表示文本嵌入函数，$C$ 表示概念集合。我们遍历该矩阵，并将与已保留概念的相似度超过阈值 $S_{\max}$ 的概念予以剔除。
+
+表~1 列出了该流程针对不同应用所推导出的基础概念。其中，DDoS 检测（表~1c）所需的人工干预最少；自适应比特率流媒体（表~1a）需要在初始集合基础上进行扩充；拥塞控制（表~1b）则需要进行过滤与调整。当所使用的综述文献与控制器设计文档的视角存在差异时，基础概念集合往往需要更多调优。保真度可以作为这一过程的重要参考指标：数据或概念集合不充分时，会产生低保真度的解释；此外，第 5.3 节及附录 A.1 中的鲁棒性分析也可提供辅助判断依据。
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{三类应用（自适应比特率流媒体、拥塞控制、DDoS 检测）所使用的基础概念。这些概念是 Agua 解释的基本单元，控制器的输出被表达为这些概念的线性组合。}
+\label{tab:concepts}
+\begin{tabular}{p{7.2cm}}
+\toprule
+\textbf{(a) 自适应比特率流媒体（ABR）的概念} \\
+\midrule
+1. 网络吞吐量剧烈波动 \quad 9. 缓冲区稳定 \\
+2. 缓冲区快速耗尽 \quad 10. 缓冲区接近饱满 \\
+3. 内容复杂度低 \quad 11. 视频启动阶段 \\
+4. 网络状况近期改善 \quad 12. 内容复杂度高 \\
+5. 网络状况极度恶化 \quad 13. 网络波动需要切换画质 \\
+6. 网络吞吐量适中 \quad 14. 避免画质大幅波动 \\
+7. 预判到网络拥塞 \quad 15. 启动后切换至更高画质 \\
+8. 内容需要高画质 \quad 16. 网络吞吐量高 \\
+\bottomrule
+\end{tabular}
+
+\vspace{8pt}
+\begin{tabular}{p{7.2cm}}
+\toprule
+\textbf{(b) 拥塞控制（CC）的概念} \\
+\midrule
+1. 丢包率上升 \\
+2. 丢包率下降 \\
+3. 网络状况稳定 \\
+4. 时延快速上升 \\
+5. 时延快速下降 \\
+6. 网络状况剧烈波动 \\
+7. 网络利用率低 \\
+8. 网络利用率高 \\
+\bottomrule
+\end{tabular}
+
+\vspace{8pt}
+\begin{tabular}{p{7.2cm}}
+\toprule
+\textbf{(c) DDoS 检测的概念} \\
+\midrule
+1. 地理与时间一致性 \quad 6. 协议异常 \\
+2. 典型的应用行为 \quad 7. 重复访问请求 \\
+3. 低速慢速攻击特征 \quad 8. 行为异常 \\
+4. 高请求速率 \quad 9. 负载异常 \\
+5. 地理位置异常 \quad 10. 协议合规性 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Agua 模型的训练数据}
+
+要训练 Agua 的代理模型，需要有标签数据——即需要为控制器的输入标注出其中所包含的基础概念。然而正如第 2.2 节所述，为网络系统控制器设计一套概念标注机制颇具挑战：众包或多模态模型等常用手段，因系统输入本身的异构性而难以适用；此外，由于系统概念本身较为复杂，单个概念往往横跨多个输入特征、多个时间点，并涉及多个抽象层级。
+
+为应对这些挑战，我们分两个阶段准备训练数据。第一阶段，我们将系统控制器的输入转换为文本描述，从而把控制器异构的输入空间统一映射到同一语义空间。我们借助大语言模型将这一过程自动化：向其提供基础概念、输入特征以及每个特征的简要说明，并提示大语言模型通过填写预定义的空白项来描述该输入样本（完整的提示示例及生成的描述参见附录图~15、图~16）。这种结构化的思维链式提示方式，引导大语言模型仔细审视各输入特征，并思考它们可能与哪些底层概念相关联（对应图~2 中的步骤\textcircled{2}"输入描述生成"）。
+
+第二阶段，我们通过实验方式测量输入的完整文本描述与各基础概念之间的语义相似度：利用文本嵌入模型对基础概念与输入描述分别进行嵌入，并计算两组向量之间的距离，然后将该相似度得分量化为“低、中、高”三个等级，相似度为“低”时视为该概念“不存在”。相比使用布尔值，将相似度划分为多个等级使得即便是低相似度的概念，在某些场景下也可能成为主导因素——例如图~4b 所示场景中，“网络吞吐量高”这一概念的\emph{缺席}恰恰是主导因素——从而使 Agua 能够泛化到系统应用中所需要的多个抽象层级（对应图~2 中的步骤\textcircled{3}“输入概念嵌入”）。
+
+形式化地，我们计算输入描述 $x$ 的文本嵌入 $\epsilon(x)$ 与每个基础概念的文本嵌入 $\epsilon(c_i)$ 之间的余弦相似度，再利用量化函数 $\psi_k(\cdot)$ 将该相似度得分量化为 $k$ 个离散等级之一。概念集合 $C$ 中概念 $c_i$ 所对应的相似度等级 $S_{c_i}$ 可表示为：
+\begin{equation}
+S_{c_i} = \psi_k\!\left(\frac{\epsilon(x)\cdot\epsilon(c_i)}{\lVert\epsilon(x)\rVert\,\lVert\epsilon(c_i)\rVert}\right), \qquad \forall c_i\in C
+\label{eq:sim-class}
+\end{equation}
+
+以上两个阶段共同构成了一种在系统场景中对概念进行结构化表示的方法，既避免了不切实际的人工标注需求，也无需为系统场景专门设计一个庞大的多模态模型。关于学习过程与归一化的具体细节，请参见第 4 节。需要说明的是，这里生成的训练数据本身并不构成解释——解释是通过训练完成后的代理模型生成的。
+
+\subsection{学习 Agua 的代理模型}
+
+本节介绍学习 Agua 基于概念的代理模型所采用的算法设计。该代理模型在使用概念作为中间表示的同时，模拟原始控制器模型的行为，凭借这一设计，我们可以揭示每个概念对控制器输出的具体贡献。
+
+根据定义~3.2，Agua 的代理函数由两个函数复合而成：概念映射函数与输出映射函数。
+
+\textbf{\textcircled{4} 概念映射函数。} 概念映射函数负责建立从控制器输入到概念空间的映射。具体而言，Agua 的概念映射函数以控制器对输入 $x$ 的嵌入表示 $h(x)$ 作为输入，这使得 Agua 能够利用嵌入空间中已有的 $x$ 的低维特征，并与控制器本身对齐。概念映射函数 $\delta_\theta$ 的形式化定义为：
+\begin{equation}
+\delta_\theta: h(x)\to\mathbb{R}^{C\cdot k}, \qquad h(x)\in\mathbb{R}^{H}
+\label{eq:concept-map}
+\end{equation}
+其中 $h$ 表示控制器的嵌入网络，$x$ 为输入。嵌入向量是维度为 $H$ 的稠密向量，其维度由控制器的架构决定。$\delta_\theta$ 是一个多标签分类模型，输出一个长度为 $C\cdot k$ 的向量，其中 $C$ 为概念数量，$k$ 为所跟踪的相似度等级数。若将该向量重排为 $C\times k$ 的矩阵，则元素 $(i,j)$ 即表示概念 $C_i$ 具有相似度等级 $k_j$ 的概率。
+
+\emph{概念映射函数的训练：} 我们将概念映射函数 $\delta_\theta$ 的训练问题构建为一个多标签分类问题，通过最小化如下交叉熵损失函数来训练 $\delta_\theta$：
+\begin{equation}
+l(x,S_C) = \frac{1}{C}\sum_{i=1}^{C}\left[-\log\!\left(\frac{e^{\delta_\theta(h(x))_{c_i,S_{c_i}}}}{\sum_{j=1}^{k} e^{\delta_\theta(h(x))_{c_i,j}}}\right)\right]
+\label{eq:ce-loss}
+\end{equation}
+其中 $S_C$ 表示真实的相似度标签，其元素 $S_{C_i}$ 是概念 $C_i$ 的真实相似度等级（例如概念“网络状况稳定”的相似度等级为“高”）。分子刻画了模型对概念 $C_i$ 真实相似度等级 $S_{C_i}$ 所给出的得分，分母则是相应的 softmax 归一化项。需要注意的是，在训练阶段，梯度不会回传至控制器的参数，从而确保原始神经网络（包括控制器的嵌入网络）保持不变。
+
+\textbf{\textcircled{5} 输出映射函数。} 输出映射函数 $\Omega$（见定义~3.2）将概念映射函数 $\delta_\theta$ 的输出映射到控制器的输出空间 $y$。我们将 $\Omega$ 定义为如下线性函数：
+\begin{equation}
+\Omega\big(\delta_\theta(h(x))\big):\; y = W^{\top}\delta_\theta(h(x)) + b
+\label{eq:output-map}
+\end{equation}
+其中 $W$ 为权重矩阵，$b$ 为偏置向量，$y$ 是维度为 $n$ 的输出向量。对分类型控制器而言，$n$ 表示输出类别数，每个元素给出对应类别的概率；对回归型控制器而言，$n$ 对应用于逼近数值型输出的离散分箱（bins）维度，此时点积 $\Omega(\delta_\theta(h(x)))\cdot bins$ 即给出数值型输出。
+
+\begin{quote}\small\noindent\textbf{图 3：}解释生成工作流程。训练完成后，Agua 对给定输入的控制器嵌入执行前向传播，给出该输出所对应的概念权重线性组合。\end{quote}
+
+\emph{输出映射函数的训练：} 我们采用监督学习方式训练输出映射函数 $\Omega$，使用小批量随机梯度下降来最小化与控制器输出之间的偏差。虽然这一训练过程可以得到精确的输出映射函数，但也引入了保真度与复杂度之间的权衡：要达到高保真度，往往需要依赖大量概念，这会使解释变得不够易懂。为平衡这一权衡，我们对 $W$ 和 $b$ 施加 ElasticNet 正则化：
+\begin{equation}
+l_{\text{elastic}} = (1-\alpha)\lVert W\rVert_2^2 + \alpha\big(\lVert W\rVert_1 + \lVert b\rVert_1\big)
+\label{eq:elastic}
+\end{equation}
+该正则化项结合了 L1 与 L2 惩罚，能够促进权重稀疏化并降低过拟合风险。
+
+\subsection{使用 Agua 生成解释}
+
+为解释给定输入 $x$ 所对应的输出，Agua 利用其代理模型揭示驱动该输出的概念权重线性组合，具体分三步完成：首先，将 $x$ 通过控制器的嵌入网络；其次，应用概念映射函数计算各概念相似度等级的概率；最后，利用输出映射函数提取线性权重，计算每个概念对输出的贡献。需要强调的是，该解释生成过程本身并不涉及大语言模型——大语言模型仅用于训练 Agua 的代理模型。
+
+下面我们基于 Agua 的代理模型对这一解释过程给出形式化推导。在代理模型中，第 $i$ 个输出类别的取值可由标准点积计算得到：
+\begin{equation}
+\Omega\big(\delta_\theta(h(x))\big)_i = W_{\langle i\rangle}\cdot\delta_\theta(h(x)) + b_i, \qquad \forall i\in[1,n]
+\label{eq:dot-product}
+\end{equation}
+其中 $W_{\langle i\rangle}$ 是权重矩阵 $W$ 的第 $i$ 行，表示输出类别 $i$ 所对应的权重，$b_i$ 是相应的标量偏置项，$n$ 表示输出的维度，即输出可能取值的数量。该点积对所有概念相似度的加权贡献求和，从而得到特定输出 $i$ 的取值。
+
+为提取每个概念的具体贡献，可以将上述点积改写为 Hadamard（逐元素）乘积的形式：
+\begin{equation}
+\Omega\big(\delta_\theta(h(x))\big)_i = \left\lVert\, W_{\langle i\rangle}\circ\delta_\theta(h(x)) + \frac{b_i}{C\cdot k} \right\rVert_1, \qquad \forall i\in[1,n]
+\label{eq:hadamard}
+\end{equation}
+这里 $W_{\langle i\rangle}$ 通过 Hadamard 乘积 $\circ$ 逐元素作用于概念相似度向量 $\delta_\theta(h(x))$，随后 $L_1$ 范数将结果向量求和。若在求 $L_1$ 范数之前停止，我们便能精确地看到每个概念在求和之前对输出 $i$ 的具体贡献。换言之，我们由此揭示了每个概念对输出的影响，从而得到基于概念的解释。
+
+\subsection{支持的解释类型}
+
+Agua 支持多种不同作用范围的解释类型。
+
+\textbf{事实性解释（Factual Explanations）。} 事实性解释说明控制器为何针对给定输入 $x$ 选择了其输出 $y_i$。我们向 Agua 查询该输出类别，取回一个概念权重向量，该向量中每个元素表示相应概念对所选输出的贡献，其总和等于 $\Omega$ 的输出结果。然而，由于 $\Omega$ 的输出未经归一化，这些权重的总和未必构成合法的概率分布。为使概念权重向量之和等于控制器输出的概率 $p$，并便于直观地读取和排序排名靠前的概念（如图~4a 所示），我们使用 softmax 对概念权重进行归一化：
+\begin{equation}
+\text{concept weight}_i = p\big(\text{argmax}(y)\big)\,\sigma(\vec{z})_i
+\label{eq:factual1}
+\end{equation}
+\begin{equation}
+\sigma(\vec{z})_i = \frac{e^{z_i}}{\sum_{j=1}^{C\cdot k} e^{z_j}}, \qquad \forall i\in C
+\label{eq:factual2}
+\end{equation}
+
+\textbf{反事实解释（Counterfactual Explanations）。} 反事实解释揭示控制器\emph{未曾}选择的某个输出 $y_i'$ 背后的原因。为此，我们利用 Agua 对任意输出类别的支持能力，直接针对 $y_i'$ 进行查询。借助这一功能，运维人员可以理解在何种条件下 $y_i'$ 本可能被选中，以及是什么因素阻止了这一选择。
+
+\textbf{单一输入解释（Single Input Explanations）。} 在这种情形下，运维人员持有一个具体实例 $x$（例如来自日志或某个样本），并请求针对该实例的解释；Agua 可对 $x$ 进行处理，给出其概念层面的分解结果。
+
+\textbf{批量输入解释（Batched Input Explanations）。} Agua 同样可以推广到成批的输入：当提供一批输入时，Agua 会对该批次内的概念贡献取平均值，从而给出对控制器行为更为整体性的视角。
+
+\section{实验设置}
+
+\textbf{输入描述生成。} 我们分两个阶段，将控制器的数值型输入转换到概念空间：(i) 输入描述生成——将控制器输入转换为文本；(ii) 输入概念嵌入——利用文本嵌入模型对文本描述与概念进行嵌入，并度量它们之间的余弦相似度。
+
+在输入描述生成阶段，我们唯一的目标是借助大语言模型将输入转换到文本空间，因此希望模型的回答尽量“照本宣科”，不对解释进行推理，也不添加任何额外信息。为此，我们采用标准的思维链（CoT）规范，通过检索相关特征、特征说明以及用于度量相似度的概念来为提示提供依据；并遵循指令遵循相关准则，为大语言模型设定具体的待填空白，以确保其完整描述该状态、不偏离既定流程。相应的提示示例与大语言模型生成的描述分别见附录图~15 和图~16。
+
+\textbf{概念映射函数。} 概念映射函数是一个带有可学习权重 $\theta$ 的参数化函数 $\delta$，充当控制器嵌入空间与中间概念空间之间的桥梁。它是一个多层结构，由 (i) 一个线性层、(ii) 一个 ReLU 激活函数、(iii) 一个层归一化（Layer-Normalization），以及 (iv) 最终的线性层组成。这四个组件共同将控制器的嵌入空间 $h$ 转换为概念相似度空间 $S_C$：第一个线性层及其后的非线性激活使概念映射函数能够从控制器嵌入中学习有意义的信息；随后，归一化层使这些信息脱离控制器嵌入原本的分布，转而更接近正态分布；这一重新归一化的步骤使得最终的线性层能够更准确地预测概念相似度得分。
+
+\textbf{输出映射函数。} 输出映射函数将概念空间重新转换回控制器的输出空间 $y$，由包含权重矩阵 $W$ 与偏置向量 $b$ 的单个线性层实现。这种逐层的工作流程使 Agua 能够以标准深度学习库和标准学习范式原生实现。
+
+\textbf{训练参数。} 在全部实验中，Agua 使用如下参数设置：对于用于从余弦相似度得分度量概念强度的量化函数，我们采用量化区间 $[0,.2]$、$[.2,.6]$、$[.6,1.0]$ 分别对应“低、中、高”三个概念相似度等级。概念映射函数是一个 2 层多层感知机（MLP），中间包含一个 LayerNorm 层。在训练概念映射函数时，批大小为 100，学习率为 0.005，训练 200 个 epoch，并使用带动量参数 0.25 的随机梯度下降优化器。在训练输出映射函数时，批大小为 200，学习率为 0.075，训练 500 个 epoch，弹性正则化参数 $\alpha$ 取 0.95，正则化系数为 $1\mathrm{e}{-5}$。
+
+\textbf{实现。} 我们以 Python 框架的形式实现 Agua：使用 OpenAI API 访问 GPT-4o-2024-08-06 以及 OpenAI 的大型文本嵌入模型；同时也提供一个开源变体，借助 HuggingFace 库调用 LLama 3.3 70B 大语言模型及 BAAI BGE-M3 文本嵌入模型。概念映射函数与输出映射函数使用 PyTorch 实现，使用 NumPy 与大语言模型数据交互，并采用 Scikit-learn 实现余弦相似度的计算。
+
+\textbf{保真度指标。} 在可解释性研究中，目标是通过一个可解释的代理模型 $f'(x)$ 来近似不透明原始模型 $f(x)$ 的预测行为，该代理模型既要模拟 $f(x)$ 的行为，又要为人类所理解。Metis、Trustee 以及本文的 Agua 均属于这一类可解释性方法。
+
+评估代理模型 $f'(x)$ 质量的标准做法是衡量它在多大程度上追踪了原始模型 $f$ 的行为，这通过\emph{保真度}指标来完成，用以衡量代理模型在数据集 $\mathcal{D}$ 上复现原模型预测结果的准确程度：
+\begin{equation}
+FD = \frac{1}{n}\sum_{i=1}^{n} \mathbb{1}\big(f(X_i) = f'(X_i)\big), \qquad \forall X_i\in\mathcal{D}
+\label{eq:fidelity}
+\end{equation}
+其中 $n$ 为数据集 $\mathcal{D}$ 中的样本数，$\mathbb{1}$ 为指示函数（当括号内命题为真时取值 1，否则取值 0）。简而言之，保真度指标 $FD$ 表示代理模型预测结果与原始模型预测结果相一致的样本所占的比例。我们直接使用该保真度指标来评估我们的代理模型，并在未参与训练的测试数据集 $\mathcal{D}$ 上汇报结果。
+
+\section{评估}
+
+本节首先展示 Agua 在三类不同系统应用——自适应视频流、拥塞控制与 DDoS 检测——上生成的解释；随后介绍 Agua 在支持学习增强型系统整个生命周期方面所解锁的四项实用能力；最后，我们评估 Agua 在流水线各环节抵御噪声的鲁棒性，并分析其可解释能力。
+
+\subsection{Agua 的解释}
+
+我们将 Agua 应用于三类应用，展示其分别带来的理解能力。
+
+\textbf{自适应比特率流媒体。} 在自适应比特率流媒体（ABR）中，视频被切分为若干秒长的分片，并预先以多种比特率编码。流媒体播放过程中，ABR 算法根据网络状况动态为每个分片选择画质，力求最大化客户端的体验质量（QoE）。由于其重要性，业界已提出了大量学习增强型控制器。
+
+我们评估了当前最先进的深度强化学习控制器 Gelato，它服务于 Puffer 平台上的直播电视流场景。我们在其环境中运行该控制器，收集 4000 组输入-输出数据用于训练与测试，并基于表~1a 中的基础概念为该控制器训练 Agua；同时使用相同的数据集生成 Trustee 报告（即第 2.2 节所使用的报告）以作对比。
+
+如表~2 所示，Agua 成功捕捉了控制器的行为，取得了很高的保真度，甚至超过了 Trustee 针对该控制器生成的报告。我们进一步利用 Agua 探究 Gelato 的决策过程，回到第 2.2 节的动机场景：运维人员想弄清楚，为何尽管缓冲区正在回升，控制器依然选择了较低画质而非中等画质的比特率。我们首先针对控制器所选择的比特率，向 Agua 查询一个事实性解释（图~4a）。运维人员可以立即看出，控制器选择低画质比特率的主要原因在于其感知到了"网络状况极度恶化"，其次是"网络状况近期改善"这一次要因素的小幅影响，可能与视频分片传输时间的趋势有关。我们进一步分析输入数据以验证这些概念：可以观察到，反映客户端接收每个 2 秒视频分片所耗时间的传输时间，在近期历史中从 1 秒显著上升到 3 秒（对应图~1a），证实了网络状况的显著恶化；同时也观察到最近一个时间步该指标回落至 2 秒，印证了"网络状况近期改善"这一概念的存在。
+
+我们进一步针对运维人员所期望的中等画质比特率，生成反事实解释（图~4b）。该解释表明：若"避免画质大幅波动"与"网络吞吐量适中"这两个概念更为主导，且"网络吞吐量高"这一概念不存在，控制器便会选择中等画质。运维人员原本因缓冲区正在回升而预期出现中等画质，但正如 Agua 所揭示的，模型的决策过程对与吞吐量相关的概念赋予了比缓冲区相关概念更高的权重，这与其最初选择中等画质的理由相呼应：尽管缓冲区已有改善，但由于吞吐量尚未充分恢复，控制器仍然选择了较低的比特率。由此可见，事实性解释与反事实解释相结合，为运维人员的疑问提供了清晰的答案。
+
+\begin{quote}\small\noindent\textbf{图 4：}ABR 动机问题的基于概念解释。(a) 控制器所选比特率的概念级解释；(b) 针对中等画质的反事实解释。两幅图共同揭示了控制器选择低画质比特率的原因，并展示了推动其转向中等画质的主要概念。\end{quote}
+
+\textbf{拥塞控制。} 拥塞控制（CC）算法负责确定共享网络上合适的数据发送速率，力求在防止网络拥塞崩溃的同时最大化性能。近年来，学习增强型拥塞控制算法相继被提出，它们依赖对网络往返时延、吞吐量、丢包率等指标的复杂分析。
+
+我们评估了用于拥塞控制的深度强化学习控制器 Aurora。Aurora 以客户端时延、吞吐量与丢包相关的统计量为输入，输出对当前数据发送速率的离散化调整（调整范围从 $\tfrac12\times$ 到 $2\times$）。我们在其环境中运行该控制器，收集 2000 条训练数据与 4000 条测试数据，基于表~1b 中列出的基础概念为 Aurora 训练 Agua，并使用同一训练/测试集生成 Trustee 报告加以对比。
+
+如表~2 所示，Agua 在该应用上同样取得了很高的保真度，显著优于 Trustee。这一差距凸显了基于特征的解释器在保真度与复杂度之间存在的严格权衡：要给出高质量解释，往往需要依赖大量单独特征。相比之下，Agua 能够泛化到更高层次，使运维人员以其自然而然的方式理解控制器行为。在该应用中，运维人员注意到，即便网络状况看似稳定，控制器的吞吐量输出也出现了大幅波动。
+
+然而，由于拥塞控制的调整发生在毫秒甚至亚毫秒级别的精细时间尺度上，仅依靠单个输入-输出对来理解运维人员所遇到的场景颇为困难。为此，我们利用 Agua 的批量推理模式，在时间维度上聚合洞察：我们在交叉流量模式下运行控制器，记录其输入，识别关键时间区间，并针对这些区间向 Agua 查询事实性解释。图~9 将这些解释与吞吐量曲线一并可视化，并标注出 Agua 所识别的主导概念（阴影区域表示可用带宽容量）。由此，运维人员可以看到：当没有出现"网络状况剧烈波动"迹象时，控制器能够维持稳定的吞吐量；而一旦出现"时延快速上升"，便会大幅削减吞吐量，并随着"丢包率下降"而恢复。这种全局视角揭示了吞吐量波动背后的原因，而这类原因在仅关注单个输入样本与速率变化时往往会被忽略。
+
+\textbf{DDoS 检测。} 分布式拒绝服务（DDoS）攻击是破坏性最强的网络攻击方式之一。攻击者常常利用物联网设备（如摄像头或温度计）中的漏洞组建僵尸网络，向单一目标发起流量型攻击，攻击流量峰值可超过 1 Tbps，且难以检测。
+
+LUCID 是一个深度监督学习控制器，旨在攻击发起到造成服务中断之间极短的时间窗口内完成检测。它以流量的底层统计信息为输入，预测该流量是良性流量还是 DDoS 攻击的一部分。我们沿用 LUCID 在 CIC-DDoS2019 数据集上的处理流程，使用 1000 条样本用于训练、450 条样本用于测试，同样为 LUCID 训练 Agua，并展示表~1c 中所生成的基础概念。
+
+与其他应用类似，如表~2 所示，Agua 以高保真度捕捉了该控制器的行为，优于 Trustee。我们进一步探究 LUCID 识别 DDoS 攻击的具体机制：首先，在良性流量上评估 LUCID，观察到其能够正确地将其归类为良性；我们向 Agua 查询针对这些流量的批量事实性解释，结果如图~6a 所示，可以看到良性流量主要是通过"典型的应用行为"以及"负载异常"的\emph{缺失}被识别出来的，这可能体现在这些流量中 HTTP 请求所呈现的典型 TCP 确认模式上。为深入探究，我们在执行 TCP SYN 洪泛攻击的流量上评估 LUCID，并向 Agua 查询其正确检测出此类攻击的原因。从图~6b 可以看到，这些流量之所以被标记为 DDoS，主要归因于"负载异常"与"协议异常"。这类模式往往体现在流量中出现大量 TCP SYN 数据包，攻击者并不对服务器发出的 SYN/ACK 握手包进行确认，反而持续向服务器发送更多 SYN 数据包。综合这些解释，运维人员得以理解 LUCID 在 CIC-DDoS2019 流量中识别攻击模式的机制，也印证了 LUCID 能够稳定一致地完成这一检测任务。
+
+\begin{quote}\small\noindent\textbf{图 6：}Agua 对 LUCID 决策过程的解释，揭示了其检测 DDoS 流量的机制。(a) LUCID 判定良性流量的解释；(b) LUCID 标记 TCP SYN 洪泛攻击的解释。\end{quote}
+
+\begin{table}[htbp]
+\centering
+\small
+\caption{解释评估：将 Agua 与当前最先进的特征级解释器 Trustee 进行保真度对比。我们对 Agua 的两个版本进行了基准测试：一个开源版本，使用 LLama 3.3 70B 大语言模型与 BAAI BGE-M3 嵌入；一个闭源版本，使用 GPT-4o 大语言模型与 OpenAI 大型嵌入模型。}
+\label{tab:fidelity}
+\begin{tabular}{lcccc}
+\toprule
+\multirow{2}{*}{应用} & \multicolumn{2}{c}{Trustee} & \multicolumn{2}{c}{Agua} \\
+ & 完整树 & 剪枝树 & LLama 3.3 & GPT-4o \\
+\midrule
+ABR（自适应比特率流媒体） & 0.946 & 0.949 & 0.982 & 0.983 \\
+CC（拥塞控制） & 0.215 & 0.235 & 0.932 & 0.936 \\
+DDoS 检测 & 0.991 & 0.977 & 0.996 & 1.000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{应用 Agua 提升系统能力}
+
+本节展示 Agua 在学习增强型系统中所解锁的实际能力。概念这一抽象层次，使得可以使用运维人员所熟悉的领域术语来推理数据驱动系统，帮助他们管理系统生命周期的每个阶段——从设计、测试到部署与再训练。
+
+\subsubsection{基于概念的分布漂移检测}
+
+学习增强型系统在部署过程中常常会面对动态变化的工作负载或真实世界的网络状况，此时数据分布漂移十分常见。例如，在 ABR 控制器 Gelato 长达一年多的部署周期中，我们可以观察到客户端网络状况出现了漂移的迹象。分析这一问题的标准做法是围绕某个关键变量比较两个分布，对 ABR 而言，这个变量通常是客户端吞吐量。为此，我们绘制了 Puffer 平台上分别采集于 2024 年 6 月与 2021 年 4-5 月（训练数据采集期）的吞吐量分布（图~7），可以看到该分布已发生显著变化，但仅凭该图无法理解这种漂移的具体性质。
+
+Agua 基于概念的视角可以解决这一问题：我们在两个数据集上分别运行控制器，得到控制器在所有轨迹中遇到的各个状态，在轨迹层面对这些状态进行聚合，并生成 Agua 的批量输入解释；随后为每条轨迹标注排名前三的主导概念，并绘制这些概念在两个数据集中所占的比例（图~5）。结果显示，分布在概念层面上已经发生了变化："网络吞吐量剧烈波动""缓冲区快速耗尽""网络状况近期改善"以及"内容复杂度高"等概念的占比有所上升，而"缓冲区稳定""网络状况极度恶化"等概念的占比则有所下降。基于这一层面的信息，运维人员可以精确判断数据漂移所带来的影响，甚至可以据此设计相应的缓解策略，详见下文。
+
+\begin{quote}\small\noindent\textbf{图 7：}ABR 控制器在 2021 年训练数据与 2024 年部署数据之间所经历的网络吞吐量漂移。\end{quote}
+
+\begin{quote}\small\noindent\textbf{图 5：}借助 Agua 检测自适应比特率流媒体部署中的数据分布漂移。我们分析两个数据集中输入的主导概念并进行聚合，可视化所得到的归一化占比。\end{quote}
+
+\subsubsection{概念驱动的再训练}
+
+系统中依赖输入数据的深度强化学习控制器，通常使用来自目标环境的轨迹数据进行训练。一旦出现分布漂移，用于训练控制器的数据便可能变得陈旧，从而损害性能。此时常见的解决方案是在新数据上对控制器进行再训练，往往采用持续再训练的流程；然而，对于系统中的深度强化学习控制器而言，这一过程可能既繁琐又消耗大量计算资源。
+
+相比之下，得益于 Agua 能够在概念层面识别分布发生了怎样的变化，我们可以据此设计一种无需在整个数据集上重新训练即可应对漂移的高效纠正策略。具体而言，借助 Agua 对轨迹的概念标注，我们可以比较两个数据集之间概念分布的差异，识别出占比有所上升的概念——例如第 5.2.1 节图~5 所展示的两个 Puffer 数据集之间的概念层面差异。随后，运维人员便可只针对原始数据集中代表性不足的那部分轨迹子集（图~5 中以红色标出）进行再训练。
+
+图~8 比较了概念驱动的再训练流程与传统的全量再训练方式：结果表明，无论是在全部网络轨迹还是在慢速网络轨迹上，基于概念的再训练都优于标准再训练方式，能够收敛到更高的平均 QoE。此外还可以观察到，基于概念的再训练策略更为稳定，QoE 随训练步数稳步提升；而传统再训练过程则表现得较为嘈杂，QoE 在整个训练过程中反复起伏，即便训练超过一千万个时间步，传统再训练方式依然无法追平概念驱动方法的效果。这一结果既印证了已有研究关于输入轨迹分布过宽会给强化学习训练带来困难的结论，也凸显了通过基于概念的分析对分布进行聚焦与过滤后所能带来的性能提升。
+
+\begin{quote}\small\noindent\textbf{图 8：}针对分布漂移进行再训练后 ABR 控制器的性能表现。\end{quote}
+
+\subsubsection{提升可调试性}
+
+调试学习增强型系统尤其具有挑战性，因为运维人员必须超越当前的控制器与系统本身，去发掘潜藏的故障点。传统上，这意味着需要反复进行统计分析、构建并解读决策树，并手工整合各类洞察。
+
+借助 Agua，运维人员可以直接查看统一了上述各个步骤、类似专家水平的解释。以第 5.1 节中拥塞控制场景为例——尽管网络状况保持稳定，控制器的吞吐量输出却出现波动——通过查看 Agua 的解释（图~9），可以发现控制器持续感知到"时延快速上升"，因而即便网络状况实际稳定，也过度激进地限制了吞吐量。
+
+基于这一解释，我们可以判断控制器对时延的感知存在偏差，缺乏充分的时延上下文信息。为此，我们增加了一个"平均时延"特征，并将历史窗口长度从 10 扩展到 15；同时调整训练参数——将学习率从 $1\times10^{-4}$ 降低至 $7.5\times10^{-5}$，并提高熵系数，以帮助控制器在更丰富的特征集合上平稳收敛。图~10 展示了改进效果：修正后的控制器（图中红色）在接近链路满容量附近保持稳定，而原始控制器（图中蓝色）则出现震荡。通过在 Agua 中可视化控制器的决策过程，我们得以自然而然地识别并实施了实现稳定、高吞吐量方案所需的改动。
+
+\begin{quote}\small\noindent\textbf{图 9：}Agua 对 Aurora 行为的解释，展示了随时间变化所识别出的高层次概念。\end{quote}
+
+\begin{quote}\small\noindent\textbf{图 10：}借助 Agua 调试 Aurora，使其吞吐量在接近链路容量处保持稳定。\end{quote}
+
+\subsubsection{概念引导的数据集扩充}
+
+数据是所有数据驱动型学习增强系统的关键组成部分。然而，在面对客户端工作负载或新兴应用场景时，运维人员往往难以获得充分规模的数据集，可能只拥有一个庞大的通用数据集，或仅有针对目标工作负载的少量样本。在这种情况下，数据扩充或数据增强可能是唯一的选择。
+
+凭借其基于概念的视角，Agua 可以成为数据集扩充的有力工具：借助数据生成流程（图~2 中的阶段 1、2、3），Agua 可以将已有数据嵌入到丰富的概念空间中，构建一个已知数据集的概念层面存储；随后，给定目标工作负载的少量样本，即可依据余弦相似度在概念空间中检索出最相近的样本，组装出一个更贴近目标工作负载、规模更大的新数据集。
+
+为评估生成的输出分布是否与目标工作负载分布紧密吻合，我们首先基于文本嵌入（图~2 中阶段 3 的产物）对已有数据进行聚类：每种工作负载在得到的聚类簇上通常呈现出独特的分布模式，例如图~11 中的 3G 工作负载，50\% 的轨迹落入簇 1，10\% 落入簇 2，依此类推。我们采用 Kolmogorov–Smirnov 检验（KS 检验）比较生成数据分布与目标工作负载分布的相似度，该检验通过计算经验累积分布函数之间距离的上确界来衡量两者的接近程度。
+
+我们通过组装四种不同网络工作负载（3G、4G、5G 与宽带）的数据集，对 Agua 在该任务上的能力进行了实证评估：在这四类数据集上分别运行 Gelato，并在工作负载层面聚合状态，随后使用 Agua 的数据生成流程构建各工作负载的大规模数据存储。接着，用每种工作负载中留出的一小部分样本对该数据存储进行查询，按余弦距离聚合与目标工作负载最相似的样本，组装出各类型的新扩充数据集。图~11 展示了该分析的结果，图中绘制了各数据集在统一聚类坐标轴上的经验累积分布函数，可以看到扩充采样得到的数据紧密贴合原始分布的累积分布曲线；在每种情形下，KS 检验统计量均低于 0.08，表明两个分布高度相似。这证明了 Agua 能够紧密追踪数据特征，切实缓解学习增强型系统整个生命周期中所面临的相关问题。
+
+\begin{quote}\small\noindent\textbf{图 11：}数据集扩充效果，表明 Agua 仅凭少量样本即可紧密匹配目标工作负载的分布。\end{quote}
+
+\subsection{Agua 的鲁棒性}
+
+为进一步验证 Agua 解释的高保真度，本节针对图~12 所示流水线中的多个环节开展了一系列鲁棒性实验。
+
+\textbf{多次大语言模型查询。} 首先，我们评估 Agua 的输入概念嵌入（即通过大语言模型与文本嵌入模型得到的取值）对大语言模型输出固有随机性的敏感程度。我们对同一输入样本反复查询大语言模型以生成描述，并据此生成相应的输入概念嵌入；随后确定所有查询结果中强度排名前五的概念，测量这些整体前五概念在每次单独查询的前五名中出现的频率（即召回率），结果如图~12a 所示。可以观察到，在所有应用中，整体排名靠前的概念被召回的比例均超过 80\%。这一结果印证了 Agua 以数据为先的经验性概念相似度识别方法所具备的鲁棒性，表明其能够抵御大语言模型输出中固有的随机性。
+
+\textbf{对大语言模型输入样本添加噪声。} 接下来，我们分析输入概念嵌入对输入样本中噪声的鲁棒性，以确保数据采集过程中的噪声条件（例如测量延迟、转换误差）不会显著影响嵌入结果。我们首先通过查询某输入样本 $x$ 的描述与概念映射，获得基线取值；随后向 $x$ 添加幅度不超过其标准差 0.07 倍（约 5\% 噪声）的扰动，重新生成概念强度，并从这些含噪声的变体中收集多个嵌入结果，测量每个含噪声样本前五名概念中包含基线前五名概念的召回率。结果如图~12b 所示：Agua 的流水线对这种噪声保持了较好的鲁棒性，在各应用中同样取得了超过 0.80 的召回率，确保了训练数据在存在潜在瑕疵情况下依然有效。
+
+\textbf{对解释器添加输入噪声。} 最后，我们分析 Agua 完成训练后所生成的解释对输入样本噪声的鲁棒性：先为输入样本 $x$ 生成基线事实性解释，再对 $x$ 施加同样的 5\% 噪声并重新生成解释，结果如图~12c 所示，将含噪声的解释与基线解释进行对比。得益于训练数据的稳定性，解释器依然保持鲁棒，在各应用中的召回率均接近 0.9。上述实验共同证明了 Agua 的解释在面对潜在故障点时的可靠性。
+
+\begin{quote}\small\noindent\textbf{图 12：}Agua 的鲁棒性：可视化其流水线多个环节受到扰动时的影响。(a) 大语言模型在多次查询下的鲁棒性；(b) 输入添加超过 5\% 噪声时的鲁棒性；(c) Agua 解释在 5\% 噪声下的鲁棒性。\end{quote}
+
+\section{讨论与局限性}
+
+本文建立在我们此前关于学习系统基于概念的可解释性研究基础之上，我们将 Agua 视为迈向实际学习增强型系统概念层面分析的一块基石，而非一劳永逸的终极方案，旨在为未来工作铺路。
+
+\textbf{临时性文本可解释方案。} 除 Agua 之外，将自然语言理解引入数据驱动应用还有许多尚未探索的途径，例如提示大语言模型将决策树转换为文本，甚至直接让其对控制器行为进行总结。这些方向虽然值得探索，但也会带来额外的挑战——可解释性领域的方案往往难以评估。就此而言，Agua 提供了一种天然的评估手段：作为一种与 Trustee、Metis 类似的代理模型技术，Agua 可以通过保真度这一指标进行实证评估，该指标衡量了它对控制器的模拟程度；相比之下，不构建此类模型的大语言模型方案则缺乏这样的统计度量手段。
+
+\textbf{更简单类别的机器学习控制器。} Agua 能够帮助理解深度学习控制器，涵盖了广泛应用于监督学习、半监督学习与强化学习中的各类控制器。然而，就目前的形式而言，Agua 的概念层面视角尚无法推广到那些虽比神经网络简单、但依然难以理解的控制器类别（例如决策树、梯度提升机等）。这一局限源于 Agua 依赖控制器提供的固定维度向量嵌入，而这类更简单的模型未必能提供这样的嵌入表示。围绕这些模型进行编码的相关研究或许有助于弥合这一差距。
+
+\textbf{欠佳的基础概念。} 基础概念是 Agua 生成解释的构件，控制器的输出被表示为这些概念的线性组合。由于控制器的输入被投影到这一概念空间中，基础概念的质量直接影响 Agua 的保真度。与决策树方法中启发式规则所导致的欠佳决策基础会降低解释保真度类似，欠佳的基础概念同样会削弱解释的保真度——我们在附录 A.1 中研究概念空间规模对保真度的影响时也观察到了这一现象。然而，如何确定最优的概念集合仍是一个具有挑战性的问题；围绕更好地过滤与扩充概念集合的相关研究，有望进一步提升 Agua 的保真度。
+
+\textbf{大语言模型的可靠性。} 当前的大语言模型仍可能不可靠，会对提示细节产生幻觉或给出不一致的输出。为应对这种不可靠性，我们将 Agua 构建为一种代理模型式的解释器：尽管大语言模型被用于生成其训练数据，但 Agua 的解释仅依赖于该代理模型本身（如第 3.6 节所述，生成解释时并不使用大语言模型）。这种分离设计使 Agua 的训练过程能够抵御大语言模型输出中的噪声——大语言模型对某个控制器输入的错误描述，并不会使最终解释失效，因为该解释是基于对整体数据的综合训练构建而成的。然而，这并不意味着 Agua 完全不受大语言模型相关问题的影响：如果大语言模型（例如由于提示词被恶意操纵，或自身存在缺陷）针对所有输入持续产生错误输出，就可能污染 Agua 的训练数据，导致解释保真度下降。此时，对大语言模型行为进行标准检查或校验（例如附录 A.2 所做的工作）便显得尤为重要。此外需要指出的是，与 Trustee、Metis 类似，Agua 是一种事后（post-hoc）可解释性方法，无法提供确切的保证——当存在多条路径可导向同一预测结果时，事后方法给出的"解释"未必能准确反映原始模型真实的推理过程。
+
+\textbf{快速发展的大语言模型研究。} 人工智能领域正在飞速演进：开源大语言模型正在取得最先进的性能，新模型层出不穷。为顺应这一趋势，我们在表~2 中使用 LLama 3.3-70B 对 Agua 进行了评估，发现该开源变体的表现几乎与 GPT-4o 持平。自我们完成实验以来，OpenAI 已经推出了在美国数学奥林匹克竞赛中名列前茅的 o1 模型，甚至发布了智能水平达到 o1 三倍的 o3 模型。随着这些模型持续进步，Agua 为限制对其依赖所采取的种种设计或许会逐渐变得不再必要。我们将这一发展趋势视为进一步佐证：应当充分利用与语言相绑定的概念的力量，这将成为人工智能与计算系统协同演进过程中的关键一步。
+
+\textbf{统一的可解释性。} 尽管 Agua 使运维人员能够理解已完成训练的神经网络控制器的行为，但它并不能揭示控制器\emph{为何}演变至此——它没有刻画随时间变化的控制回路：控制器如何影响系统，以及系统的行为又如何反过来影响控制器的训练。然而，这一视角对于设计有效的数据驱动方案可能至关重要。若能理解控制器对未来的感知方式，运维人员便能够不仅诊断最终得到的控制器本身，还能诊断用于得到该控制器的整个优化过程。将这种面向未来的视角与 Agua 相结合，可能是迈向这一统一可解释性视角的重要一步。
+
+\textbf{交互式、意图驱动的控制器设计。} 鉴于大语言模型的快速演进，我们设想基于概念的解释将为数据驱动型控制器设计带来突破，使运维人员能够通过自然语言交互来设计契合自身意图的控制器。我们相信，将输入状态映射到概念是迈向这一由智能体式人工智能驱动的设计流程的关键一步，因为它将控制器的输入与输出，同概念、语义及其相互关系这些复杂而微妙的编码连接了起来。通过将大语言模型所蕴含的逻辑与理念，同控制器专属的数据驱动学习相结合，我们希望本文的工作能够为新一类智能系统铺平道路。
+
+\section{结论}
+
+本文提出了 Agua，一个专为人类运维人员设计、基于高层次概念的全新可解释性框架。我们证明了 Agua 能够生成高保真且鲁棒的解释，其表现优于已有技术；我们进一步证明了 Agua 能够帮助运维人员在系统生命周期的各个环节直观地满足关键需求。我们希望本文的工作能够凸显基于高层次概念的解释所蕴含的潜力，并为构建这样一个框架——运维人员仅凭自身的领域专业知识与熟悉的日常语言，即可构建并管理智能系统——提供一条可行路径。
+
+\section*{致谢}
+
+感谢各位匿名审稿人提出的富有洞见的反馈意见。本工作部分得到了韩国信息通信技术规划评估院（IITP）与韩国国家研究基金会（NRF）的资助（资助编号 RS-2024-00418784 与 RS-2024-00340099）。
+
+\appendix
+\section{附录}
+
+附录中的内容为补充性材料，未经同行评审。
+
+Agua 本质上是一个基于概念的代理模型，构建了一个从控制器嵌入空间 $h(x)$ 到控制器输出空间 $f(x)$ 的可解释映射。本附录提供关于 Agua 的补充分析与设计细节。
+
+\subsection{概念空间分析}
+
+为理解 Agua 取得高保真度的原因，我们研究了输入概念空间规模对保真度的影响：通过改变概念数量，并与始终选择最常见输出的基线方法进行保真度对比。结果表明，当概念空间较小时，保真度较低，与基线相近；但随着纳入更多能够刻画控制器决策原因的概念，保真度不断提升，并最终趋于饱和，呈现出概念空间规模增大后收益递减的趋势。该实验揭示了基于概念的可解释性中保真度与复杂度之间的权衡关系，强调了在保证对控制器输出空间高覆盖率的同时，需要在保真度与所用概念数量之间取得平衡。
+
+\begin{quote}\small\noindent\textbf{图 13：}不同概念空间规模下的保真度。展示了改变概念空间规模对保真度的影响；基线表示仅预测最常见输出的解释器所对应的保真度。可以看到保真度与复杂度之间的权衡：概念空间越大保真度越高，但收益递减。\end{quote}
+
+\subsection{文本描述有效性验证}
+
+为理解大语言模型在多大程度上能够捕捉人类对输入状态模式与趋势的理解，我们开展了一项小规模验证实验：以 ABR 为示例领域，收集一组覆盖整个输出空间的控制器输入，共获得 16 个样本；对每个输入进行人工标注，填写与提供给大语言模型相同的提示模板；随后使用文本嵌入模型分别对大语言模型给出的描述与人工描述进行嵌入，并计算各自的概念相似度得分；通过计算两者在该概念空间中的两两差异来度量语义相似度，从而理解提示词在概念层面所产生的影响（余弦空间中，0 表示完全一致，1 表示完全正交）。结果显示，超过 80\% 的样本其差异小于 0.06；我们还按第 5.3 节的方法测量了前 5 个概念的召回率，结果超过 0.72。这一结果验证了大语言模型生成的描述与人工标注在语义上存在高度重合，证明大语言模型能够有效捕捉人类在概念层面所观察到的输入动态。未来可通过涉及运维人员的大规模研究对这一结论作进一步验证。
+
+\begin{quote}\small\noindent\textbf{图 14：}大语言模型描述的语义相似度：可视化大语言模型描述与人工描述在概念空间中的语义相似度，绘制两两差异的分布。余弦距离的取值范围为 $[0,1]$，差异为 1 表示完全不相关。\end{quote}
+
+\subsection{前期工作}
+
+我们曾在一篇研讨会论文中提出面向学习增强型系统的基于概念的可解释性这一初步构想，其中给出了针对 ABR 控制器的概念验证性实现。在本文（扩展投稿）中，我们对基于概念的框架 Agua 进行了形式化定义与完整实现，同时形式化了整体设计流程，并将数据驱动的过滤与分析机制融入 Agua。此外，本文在三个具体应用上对基于概念的可解释性效果进行了广泛评估，并展示了 Agua 在四个实际用例中所带来的收益；最后，本文还深入剖析了 Agua 的工作流程，评估了其在多个环节的鲁棒性，并对其概念映射能力进行了检验。
+
+附录中还包含一个完整的大语言模型提示词示例（对应正文图~15、图~16），用于为某个自适应比特率流媒体状态生成结构化的文本描述。该提示词包含完整的概念列表、对应状态的原始特征数值，以及一个预定义的结构化推理模板：模板引导大语言模型依次针对网络状况、客户端缓冲区、体验质量（QoE）、即将播放的分片大小及画质等维度，分别描述其在时间序列早期、中期与后期所呈现的模式及总体趋势，最终将这些观察归纳为与预定义基础概念相对应的结论。
+
+\begin{thebibliography}{80}
+
+\bibitem{r1} Amazon Mechanical Turk. \url{https://www.mturk.com/}.
+
+\bibitem{r2} Hello GPT-4o. OpenAI. \url{https://openai.com/index/hello-gpt-4o/}.
+
+\bibitem{r3} Introducing Structured Outputs in the API. OpenAI. \url{https://openai.com/index/introducing-structured-outputs-in-the-api/}.
+
+\bibitem{r4} New embedding models and API updates. OpenAI. \url{https://openai.com/index/new-embedding-models-and-api-updates/}.
+
+\bibitem{r5} OpenAI o1 Hub. OpenAI. \url{https://openai.com/o1/}.
+
+\bibitem{r6} Soheil Abbasloo, Chen-Yu Yen, and H Jonathan Chao. 2020. Classic meets modern: A pragmatic learning-based congestion control for the Internet. In \emph{Proceedings of the Annual conference of the ACM Special Interest Group on Data Communication}. 632--647.
+
+\bibitem{r7} Josh Achiam et al. 2023. Gpt-4 technical report. \emph{arXiv preprint arXiv:2303.08774}.
+
+\bibitem{r8} Open AI. openai-python: The official Python library for the OpenAI API. \url{https://github.com/openai/openai-python}.
+
+\bibitem{r9} Jimmy Lei Ba, Jamie Ryan Kiros, and Geoffrey E Hinton. 2016. Layer normalization. \emph{arXiv preprint arXiv:1607.06450}.
+
+\bibitem{r10} Vaishak Belle and Ioannis Papantonis. 2021. Principles and practice of explainable machine learning. \emph{Frontiers in big Data} 4 (2021), 688969.
+
+\bibitem{r11} Luca Beurer-Kellner, Marc Fischer, and Martin Vechev. 2023. Prompting is programming: A query language for large language models. \emph{Proceedings of the ACM on Programming Languages} 7, PLDI (2023), 1946--1969.
+
+\bibitem{r12} Tom Brown et al. 2020. Language models are few-shot learners. \emph{Advances in neural information processing systems} 33 (2020), 1877--1901.
+
+\bibitem{r13} Nadia Burkart and Marco F Huber. 2021. A survey on the explainability of supervised machine learning. \emph{Journal of Artificial Intelligence Research} 70 (2021), 245--317.
+
+\bibitem{r14} Arthur Choi, Andy Shih, Anchal Goyanka, and Adnan Darwiche. 2020. On symbolically encoding the behavior of random forests. \emph{arXiv preprint arXiv:2007.01493}.
+
+\bibitem{r15} Devleena Das, Sonia Chernova, and Been Kim. 2023. State2explanation: Concept-based explanations to benefit agent learning and user understanding. \emph{Advances in Neural Information Processing Systems} 36 (2023), 67156--67182.
+
+\bibitem{r16} Roberto Doriguzzi-Corin, Stuart Millar, Sandra Scott-Hayward, Jesus Martinez-del Rincon, and Domenico Siracusa. 2020. LUCID: A practical, lightweight deep learning solution for DDoS attack detection. \emph{IEEE Transactions on Network and Service Management} 17, 2 (2020), 876--889.
+
+\bibitem{r17} Abhimanyu Dubey et al. 2024. The llama 3 herd of models. \emph{arXiv preprint arXiv:2407.21783}.
+
+\bibitem{r18} Radwa El Shawi. 2024. ConceptGlassbox: Guided Concept-Based Explanation for Deep Neural Networks. \emph{Cognitive Computation} (2024), 1--14.
+
+\bibitem{r19} David B Fogel. 2006. \emph{Evolutionary computation: toward a new philosophy of machine intelligence}. John Wiley \& Sons.
+
+\bibitem{r20} Amirata Ghorbani, James Wexler, James Y Zou, and Been Kim. 2019. Towards automatic concept-based explanations. \emph{Advances in neural information processing systems} 32 (2019).
+
+\bibitem{r21} Charles R. Harris et al. 2020. Array programming with NumPy. \emph{Nature} 585, 7825 (2020), 357--362.
+
+\bibitem{r22} Jeremy Hsu. OpenAI's o3 model aced a test of AI reasoning -- but it's still not AGI. \emph{New Scientist}.
+
+\bibitem{r23} Arthur S Jacobs, Roman Beltiukov, Walter Willinger, Ronaldo A Ferreira, Arpit Gupta, and Lisandro Z Granville. 2022. Ai/ml for network security: The emperor has no clothes. In \emph{Proceedings of the 2022 ACM SIGSAC Conference on Computer and Communications Security}. 1537--1551.
+
+\bibitem{r24} Nathan Jay, Noga Rotman, Brighten Godfrey, Michael Schapira, and Aviv Tamar. 2019. A deep reinforcement learning perspective on internet congestion control. In \emph{International conference on machine learning}. PMLR, 3050--3059.
+
+\bibitem{r25} James A Jerkins. 2017. Motivating a market or regulatory solution to IoT insecurity with the Mirai botnet code. In \emph{2017 IEEE 7th annual computing and communication workshop and conference (CCWC)}. IEEE, 1--5.
+
+\bibitem{r26} Pang Wei Koh, Thao Nguyen, Yew Siang Tang, Stephen Mussmann, Emma Pierson, Been Kim, and Percy Liang. 2020. Concept bottleneck models. In \emph{International conference on machine learning}. PMLR, 5338--5348.
+
+\bibitem{r27} Pang Wei Koh et al. 2021. Wilds: A benchmark of in-the-wild distribution shifts. In \emph{International conference on machine learning}. PMLR, 5637--5664.
+
+\bibitem{r28} Narine Kokhlikyan et al. 2020. Captum: A unified and generic model interpretability library for pytorch. \emph{arXiv preprint arXiv:2009.07896}.
+
+\bibitem{r29} Constantinos Kolias, Georgios Kambourakis, Angelos Stavrou, and Jeffrey Voas. 2017. DDoS in the IoT: Mirai and other botnets. \emph{Computer} 50, 7 (2017), 80--84.
+
+\bibitem{r30} Kirill Krinkin, Yulia Shichkina, and Andrey Ignatyev. 2021. Co-evolutionary hybrid intelligence. In \emph{2021 5th Scientific School Dynamics of Complex Networks and their Applications (DCNA)}. IEEE, 112--115.
+
+\bibitem{r31} Hyafil Laurent and Ronald L Rivest. 1976. Constructing optimal binary decision trees is NP-complete. \emph{Information processing letters} 5, 1 (1976), 15--17.
+
+\bibitem{r32} Yi Liu et al. 2023. Prompt Injection attack against LLM-integrated Applications. \emph{arXiv preprint arXiv:2306.05499}.
+
+\bibitem{r33} Scott M Lundberg and Su-In Lee. 2017. A Unified Approach to Interpreting Model Predictions. In \emph{Advances in Neural Information Processing Systems 30}. 4765--4774.
+
+\bibitem{r34} Scott M Lundberg and Su-In Lee. 2017. A Unified Approach to Interpreting Model Predictions. In \emph{Advances in Neural Information Processing Systems 30}. 4765--4774.
+
+\bibitem{r35} Hongzi Mao et al. 2020. Real-world video adaptation with reinforcement learning. \emph{arXiv preprint arXiv:2008.12858}.
+
+\bibitem{r36} Hongzi Mao, Ravi Netravali, and Mohammad Alizadeh. 2017. Neural adaptive video streaming with pensieve. In \emph{Proceedings of the Conference of the ACM Special Interest Group on Data Communication}. 197--210.
+
+\bibitem{r37} Hongzi Mao, Shaileshh Bojja Venkatakrishnan, Malte Schwarzkopf, and Mohammad Alizadeh. 2018. Variance reduction for reinforcement learning in input-driven environments. \emph{arXiv preprint arXiv:1807.02264}.
+
+\bibitem{r38} Zili Meng, Minhu Wang, Jiasong Bai, Mingwei Xu, Hongzi Mao, and Hongxin Hu. 2020. Interpreting deep learning-based networking systems. In \emph{Proceedings of the Annual conference of the ACM Special Interest Group on Data Communication}. 154--171.
+
+\bibitem{r39} Azalia Mirhoseini et al. 2021. A graph placement methodology for fast chip design. \emph{Nature} 594, 7862 (2021), 207--212.
+
+\bibitem{r40} Pramod Kaushik Mudrakarta, Ankur Taly, Mukund Sundararajan, and Kedar Dhamdhere. 2018. Did the model understand the question? \emph{arXiv preprint arXiv:1805.05492}.
+
+\bibitem{r41} Multi-Linguality Multi-Functionality Multi-Granularity. M3-Embedding: Multi-Linguality, Multi-Functionality, Multi-Granularity Text Embeddings Through Self-Knowledge Distillation.
+
+\bibitem{r42} W James Murdoch and Arthur Szlam. 2017. Automatic rule extraction from long short term memory networks. \emph{arXiv preprint arXiv:1702.02540}.
+
+\bibitem{r43} Meike Nauta et al. 2023. From anecdotal evidence to quantitative evaluation methods: A systematic review on evaluating explainable ai. \emph{Comput. Surveys} 55, 13s (2023), 1--42.
+
+\bibitem{r44} OpenAI. OpenAI Platform. \url{https://platform.openai.com/docs/guides/text}.
+
+\bibitem{r45} OpenAI. Sycophancy in GPT-4o: What happened and what we're doing about it. \url{https://openai.com/index/sycophancy-in-gpt-4o}.
+
+\bibitem{r46} Adam Paszke et al. 2019. Pytorch: An imperative style, high-performance deep learning library. \emph{Advances in neural information processing systems} 32 (2019).
+
+\bibitem{r47} Sagar Patel, Sangeetha Abdu Jyothi, and Nina Narodytska. 2023. Towards Future-Based Explanations for Deep RL Network Controllers. \emph{SIGMETRICS Perform. Eval. Rev.} 51, 2 (2023), 100--102.
+
+\bibitem{r48} Sagar Patel, Dongsu Han, Nina Narodystka, and Sangeetha Abdu Jyothi. 2024. Toward Trustworthy Learning-Enabled Systems with Concept-Based Explanations. In \emph{Proceedings of the 23rd ACM Workshop on Hot Topics in Networks}. 60--67.
+
+\bibitem{r49} Sagar Patel, Dongsu Han, Nina Narodystka, and Sangeetha Abdu Jyothi. 2024. Toward Trustworthy Learning-Enabled Systems with Concept-Based Explanations. In \emph{HotNets '24}. 60--67.
+
+\bibitem{r50} Sagar Patel, Sangeetha Abdu Jyothi, and Nina Narodytska. 2024. CrystalBox: future-based explanations for input-driven deep RL systems. In \emph{Proceedings of the AAAI Conference on Artificial Intelligence}, Vol. 38. 14563--14571.
+
+\bibitem{r51} Sagar Patel, Junyang Zhang, Nina Narodystka, and Sangeetha Abdu Jyothi. 2024. Practically High Performant Neural Adaptive Video Streaming. \emph{Proc. ACM Netw.} 2, CoNEXT4, Article 30 (2024), 23 pages.
+
+\bibitem{r52} F. Pedregosa et al. 2011. Scikit-learn: Machine Learning in Python. \emph{Journal of Machine Learning Research} 12 (2011), 2825--2830.
+
+\bibitem{r53} Alec Radford et al. 2021. Learning transferable visual models from natural language supervision. In \emph{International conference on machine learning}. PMLR, 8748--8763.
+
+\bibitem{r54} Marco Tulio Ribeiro, Sameer Singh, and Carlos Guestrin. 2016. "Why should i trust you?" Explaining the predictions of any classifier. In \emph{Proceedings of the 22nd ACM SIGKDD international conference on knowledge discovery and data mining}. 1135--1144.
+
+\bibitem{r55} Mikail Mohammed Salim, Shailendra Rathore, and Jong Hyuk Park. 2020. Distributed denial of service attacks and its defenses in IoT: a survey. \emph{The Journal of Supercomputing} 76 (2020), 5320--5363.
+
+\bibitem{r56} Simon Schrodi, Julian Schur, Max Argus, and Thomas Brox. 2024. Concept Bottleneck Models Without Predefined Concepts. \emph{arXiv preprint arXiv:2407.03921}.
+
+\bibitem{r57} Iman Sharafaldin, Arash Habibi Lashkari, Saqib Hakak, and Ali A Ghorbani. 2019. Developing realistic distributed denial of service (DDoS) attack dataset and taxonomy. In \emph{2019 international carnahan conference on security technology (ICCST)}. IEEE, 1--8.
+
+\bibitem{r58} Connor Shorten and Taghi M Khoshgoftaar. 2019. A survey on image data augmentation for deep learning. \emph{Journal of big data} 6, 1 (2019), 1--48.
+
+\bibitem{r59} Shivani Singh, Razia Sulthana, Tanvi Shewale, Vinay Chamola, Abderrahim Benslimane, and Biplab Sikdar. 2021. Machine-learning-assisted security and privacy provisioning for edge computing: A survey. \emph{IEEE Internet of Things Journal} 9, 1 (2021), 236--260.
+
+\bibitem{r60} Zhenyu Song et al. 2023. HALP: Heuristic aided learned preference eviction policy for YouTube content delivery network. In \emph{20th USENIX Symposium on Networked Systems Design and Implementation (NSDI 23)}. 1149--1163.
+
+\bibitem{r61} Yi Sun et al. 2016. CS2P: Improving video bitrate selection and adaptation with data-driven throughput prediction. In \emph{Proceedings of the 2016 ACM SIGCOMM Conference}. 272--285.
+
+\bibitem{r62} Mukund Sundararajan, Ankur Taly, and Qiqi Yan. 2017. Axiomatic attribution for deep networks. In \emph{International conference on machine learning}. PMLR, 3319--3328.
+
+\bibitem{r63} Sarah Tan, Rich Caruana, Giles Hooker, Paul Koch, and Albert Gordo. 2018. Learning global additive explanations for neural nets using model distillation. \emph{stat} 1050 (2018), 3.
+
+\bibitem{r64} Luke Taylor and Geoff Nitschke. 2018. Improving deep learning with generic data augmentation. In \emph{2018 IEEE symposium series on computational intelligence (SSCI)}. IEEE, 1542--1547.
+
+\bibitem{r65} Gemini Team et al. 2023. Gemini: a family of highly capable multimodal models. \emph{arXiv preprint arXiv:2312.11805}.
+
+\bibitem{r66} Liang Wang et al. 2022. Text embeddings by weakly-supervised contrastive pre-training. \emph{arXiv preprint arXiv:2212.03533}.
+
+\bibitem{r67} Colin White et al. 2025. LiveBench: A Challenging, Contamination-Free LLM Benchmark. In \emph{The Thirteenth International Conference on Learning Representations}.
+
+\bibitem{r68} T Wolf. 2019. Huggingface's transformers: State-of-the-art natural language processing. \emph{arXiv preprint arXiv:1910.03771}.
+
+\bibitem{r69} Zhengxu Xia, Yajie Zhou, Francis Y Yan, and Junchen Jiang. 2022. Genet: automatic curriculum generation for learning adaptation in networking. In \emph{Proceedings of the ACM SIGCOMM 2022 Conference}. 397--413.
+
+\bibitem{r70} Francis Y Yan et al. 2020. Learning in situ: a randomized experiment in video streaming. In \emph{17th USENIX Symposium on Networked Systems Design and Implementation (NSDI 20)}. 495--511.
+
+\bibitem{r71} Francis Y Yan et al. 2018. Pantheon: the training ground for Internet congestion-control research. In \emph{2018 USENIX Annual Technical Conference (USENIX ATC 18)}. 731--743.
+
+\bibitem{r72} Yue Yang, Artemis Panagopoulou, Shenghao Zhou, Daniel Jin, Chris Callison-Burch, and Mark Yatskar. 2023. Language in a bottle: Language model guided concept bottlenecks for interpretable image classification. In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition}. 19187--19197.
+
+\bibitem{r73} Chih-Kuan Yeh, Been Kim, Sercan Arik, Chun-Liang Li, Tomas Pfister, and Pradeep Ravikumar. 2020. On completeness-aware concept-based explanations in deep neural networks. \emph{Advances in neural information processing systems} 33 (2020), 20554--20565.
+
+\bibitem{r74} Mert Yuksekgonul, Maggie Wang, and James Zou. 2022. Post-hoc concept bottleneck models. \emph{arXiv preprint arXiv:2205.15480}.
+
+\bibitem{r75} Quanshi Zhang, Ruiming Cao, Feng Shi, Ying Nian Wu, and Song-Chun Zhu. 2018. Interpreting CNN knowledge via an explanatory graph. In \emph{Proceedings of the AAAI conference on artificial intelligence}, Vol. 32.
+
+\bibitem{r76} Quanshi Zhang, Yu Yang, Haotian Ma, and Ying Nian Wu. 2019. Interpreting cnns via decision trees. In \emph{Proceedings of the IEEE/CVF conference on computer vision and pattern recognition}. 6261--6270.
+
+\bibitem{r77} Tong Zhang, Fengyuan Ren, Wenxue Cheng, Xiaohui Luo, Ran Shu, and Xiaolan Liu. 2017. Modeling and analyzing the influence of chunk size variation on bitrate adaptation in DASH. In \emph{IEEE INFOCOM 2017}. IEEE, 1--9.
+
+\bibitem{r78} Xu Zhang, Yiyang Ou, Siddhartha Sen, and Junchen Jiang. 2021. SENSEI: Aligning video streaming quality with dynamic user sensitivity. In \emph{18th USENIX Symposium on Networked Systems Design and Implementation (NSDI 21)}. 303--320.
+
+\bibitem{r79} Yanqi Zhang, Weizhe Hua, Zhuangzhuang Zhou, G Edward Suh, and Christina Delimitrou. 2021. Sinan: ML-based and QoS-aware resource management for cloud microservices. In \emph{Proceedings of the 26th ACM international conference on architectural support for programming languages and operating systems}. 167--181.
+
+\bibitem{r80} Hui Zou and Trevor Hastie. 2005. Regularization and variable selection via the elastic net. \emph{Journal of the Royal Statistical Society Series B: Statistical Methodology} 67, 2 (2005), 301--320.
+
+\end{thebibliography}
+
+\end{document}
